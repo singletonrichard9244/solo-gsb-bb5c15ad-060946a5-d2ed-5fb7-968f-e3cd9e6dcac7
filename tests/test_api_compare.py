@@ -8,6 +8,7 @@
 import os
 import sys
 import tempfile
+import time
 
 _TMP_DB = tempfile.NamedTemporaryFile(prefix="weave-test-", suffix=".db", delete=False)
 _TMP_DB.close()
@@ -198,8 +199,117 @@ def test_compare_endpoint():
               "compare does not modify the stored audit")
 
 
+def test_compare_large_matrix_timing():
+    """64x64 较大矩阵的端到端耗时回归：优化前逐偏移构造完整矩阵与明细
+    单次约 19 秒，优化后（位掩码 popcount 只算计数、仅最佳偏移生成明细）
+    必须在秒级以内返回，且响应结构与错位统计保持完整、自洽。"""
+    import random
+
+    with TestClient(app) as client:
+        rng = random.Random(640064)
+        # 穿综/踏综用恒等映射，交织矩阵即 tie_up 本身，直接得到 64x64
+        identity = list(range(64))
+
+        def submit_matrix(name):
+            tie_up = [[rng.randint(0, 1) for _ in range(64)] for _ in range(64)]
+            payload = {
+                "name": name,
+                "max_float": 64,
+                "threading": identity,
+                "tie_up": tie_up,
+                "treadling": identity,
+            }
+            return client.post("/designs", json=payload).json()["id"], tie_up
+
+        aid, matrix_a = submit_matrix("random 64x64 a")
+        bid, matrix_b = submit_matrix("random 64x64 b")
+
+        start = time.perf_counter()
+        resp = client.post(f"/designs/{aid}/compare",
+                           json={"other_design_id": bid})
+        random_elapsed = time.perf_counter() - start
+        check(resp.status_code == 200, "large compare 200")
+        check(random_elapsed < 5.0,
+              f"64x64 compare returns within 5.0s (got {random_elapsed:.3f}s)")
+        data = resp.json()
+        check(data["warp_ends"] == 64 and data["weft_picks"] == 64,
+              "large compare dimensions echoed")
+        check(len(data["aligned"]) == 64
+              and all(len(row) == 64 for row in data["aligned"]),
+              "large compare aligned matrix is 64x64")
+
+        # 与朴素逐点比对对照最佳偏移与错位数。逐点循环 4096 个偏移本身约
+        # 19 秒，这里用独立的位掩码 + popcount 计数作为等价的快速对照
+        # （与 app 内部实现相互独立，逐偏移仍枚举全部行列错位）。
+        def row_mask(row):
+            mask = 0
+            for w, value in enumerate(row):
+                mask |= value << w
+            return mask
+
+        def rot_right(mask, shift):
+            return ((mask >> shift)
+                    | ((mask << (64 - shift)) & ((1 << 64) - 1)))
+
+        masks_a = [row_mask(row) for row in matrix_a]
+        rotated_b = [
+            [rot_right(row_mask(row), c) for c in range(64)]
+            for row in matrix_b
+        ]
+        best = (64 * 64 + 1, -1, -1)
+        for r in range(64):
+            shifted = [rotated_b[(h + r) % 64] for h in range(64)]
+            for c in range(64):
+                count = sum(
+                    (masks_a[h] ^ shifted[h][c]).bit_count()
+                    for h in range(64)
+                )
+                if count < best[0]:
+                    best = (count, r, c)
+        check((data["mismatch_count"], data["weft_offset"],
+               data["warp_offset"]) == best,
+              f"large compare best offset/count matches naive {best}")
+        check(abs(data["mismatch_ratio"] - best[0] / (64 * 64)) < 1e-12,
+              "large compare mismatch ratio")
+        check(len(data["mismatches"]) == best[0]
+              and sum(data["row_mismatches"]) == best[0]
+              and sum(data["col_mismatches"]) == best[0],
+              "large compare mismatch details consistent with count")
+        check(data["aligned"] == [
+            [matrix_b[(h + best[1]) % 64][(w + best[2]) % 64]
+             for w in range(64)]
+            for h in range(64)
+        ], "large compare aligned matrix follows shift convention")
+
+        # 周期纹样的 64x64：多偏移平局时仍按纬向、经向偏移升序
+        unit = [[1, 1, 0, 0], [0, 1, 1, 0], [0, 0, 1, 1], [1, 0, 0, 1]]
+        periodic = [[unit[h % 4][w % 4] for w in range(64)] for h in range(64)]
+        pid = client.post("/designs", json={
+            "name": "periodic 64x64",
+            "max_float": 64,
+            "threading": identity,
+            "tie_up": periodic,
+            "treadling": identity,
+        }).json()["id"]
+        start = time.perf_counter()
+        resp = client.post(f"/designs/{pid}/compare",
+                           json={"other_design_id": pid})
+        periodic_elapsed = time.perf_counter() - start
+        check(resp.status_code == 200 and periodic_elapsed < 5.0,
+              f"periodic 64x64 compare fast (got {periodic_elapsed:.3f}s)")
+        data = resp.json()
+        check((data["weft_offset"], data["warp_offset"],
+               data["mismatch_count"]) == (0, 0, 0),
+              "periodic self compare: (0, 0) wins ties, zero mismatches")
+        check(data["aligned"] == periodic,
+              "periodic self compare: aligned unchanged")
+        print(f"  ok: 64x64 API compare timing {random_elapsed*1000:.0f}ms "
+              f"(random pair {(best[1], best[2])}, {best[0]} mismatches)")
+
+
 if __name__ == "__main__":
     test_compare_endpoint()
+    test_compare_large_matrix_timing()
     try:
         os.unlink(_TMP_DB.name)
     except OSError:

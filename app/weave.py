@@ -862,6 +862,23 @@ def _cyclic_shift(
     ]
 
 
+def _row_masks(matrix: list[list[int]]) -> list[int]:
+    """把每行 0/1 序列压成一个整数：第 w 列为矩阵第 w 个单元
+    （mask >> w) & 1 == matrix[h][w]）。"""
+    return [
+        sum(cell << w for w, cell in enumerate(row))
+        for row in matrix
+    ]
+
+
+def _rotate_right(mask: int, shift: int, width: int) -> int:
+    """宽度 width 的位掩码循环右移 shift 位（取模回绕）。"""
+    return (
+        (mask >> shift)
+        | ((mask << (width - shift)) & ((1 << width) - 1))
+    )
+
+
 def best_alignment(
     matrix_a: list[list[int]],
     matrix_b: list[list[int]],
@@ -874,6 +891,14 @@ def best_alignment(
     与第一份矩阵逐点比较。两份矩阵尺寸必须一致（同纬同经），否则抛 DesignError。
     平局按行偏移（weft_offset）再列偏移（warp_offset）升序取先者——按偏移升序
     枚举且仅在错位严格更少时更新最优即可自然实现。不修改传入矩阵。
+
+    性能：逐偏移只算精确错位**计数**——每行压成一个整数，经向循环左移 c 列
+    等价于该整数（低位置列 0）循环右移 c 位；逐行与第一份矩阵异或后用
+    popcount（int.bit_count）求不一致位数，全程不构造完整错位矩阵。所有 H×W
+    个偏移仅做 H×W×H 次大整数异或 + popcount（64×64 约 26 万次），且计数
+    达到当前下界即提前剪枝；仅对最终最佳偏移生成一次错位坐标、行列汇总与
+    对齐矩阵。结果与朴素逐点构造完全一致：周期纹样的多偏移平局由升序枚举 +
+    严格更少才更新裁决，非方阵按各自尺寸取模，均不影响结论。
     """
     if not matrix_a or not matrix_a[0] or not matrix_b or not matrix_b[0]:
         raise DesignError("interlacing matrices must be non-empty")
@@ -885,35 +910,63 @@ def best_alignment(
             f"{len(matrix_b)}x{len(matrix_b[0])} (weft_picks x warp_ends)"
         )
 
-    best: Alignment | None = None
-    for weft_offset in range(picks):
-        for warp_offset in range(ends):
-            aligned = _cyclic_shift(matrix_b, weft_offset, warp_offset)
-            mismatches: list[MismatchPoint] = []
-            row_mismatches = [0] * picks
-            col_mismatches = [0] * ends
+    # 行掩码：位 w 对应第 w 列
+    masks_a = _row_masks(matrix_a)
+    masks_b = _row_masks(matrix_b)
+
+    # rotated_b[sr][c] = matrix_b 第 sr 行经向循环左移 c 列后的行掩码，
+    # 即整数循环右移 c 位；偏移 (r, c) 下对齐后第 h 行取
+    # rotated_b[(h + r) % picks][c]。
+    rotated_b = [
+        [_rotate_right(mask, c, ends) for c in range(ends)]
+        for mask in masks_b
+    ]
+
+    best_count = picks * ends + 1
+    best_weft = best_warp = 0
+    # 按 weft_offset、再 warp_offset 升序枚举；计数严格更少才更新，平局保留
+    # 先枚举到的（即纬向、经向偏移都最小的）最佳。
+    for r in range(picks):
+        shifted_rows = [rotated_b[(h + r) % picks] for h in range(picks)]
+        for c in range(ends):
+            count = 0
             for h in range(picks):
-                for w in range(ends):
-                    if matrix_a[h][w] != aligned[h][w]:
-                        mismatches.append(
-                            MismatchPoint(h, w, matrix_a[h][w], aligned[h][w])
-                        )
-                        row_mismatches[h] += 1
-                        col_mismatches[w] += 1
-            count = len(mismatches)
-            if best is None or count < best.mismatch_count:
-                best = Alignment(
-                    weft_offset=weft_offset,
-                    warp_offset=warp_offset,
-                    mismatch_count=count,
-                    mismatch_ratio=count / (picks * ends),
-                    mismatches=mismatches,
-                    row_mismatches=row_mismatches,
-                    col_mismatches=col_mismatches,
-                    aligned=aligned,
+                count += (masks_a[h] ^ shifted_rows[h][c]).bit_count()
+                if count >= best_count:
+                    # 行内计数单调不减；已不可能严格优于当前最佳，提前剪枝
+                    break
+            else:
+                best_count = count
+                best_weft, best_warp = r, c
+                if best_count == 0:
+                    break  # 0 已是全局下界；首个零错位即平局裁决结果
+        if best_count == 0:
+            break
+
+    # 仅对最佳偏移构造一次完整对齐矩阵与差异明细
+    aligned = _cyclic_shift(matrix_b, best_weft, best_warp)
+    mismatches: list[MismatchPoint] = []
+    row_mismatches = [0] * picks
+    col_mismatches = [0] * ends
+    for h in range(picks):
+        for w in range(ends):
+            if matrix_a[h][w] != aligned[h][w]:
+                mismatches.append(
+                    MismatchPoint(h, w, matrix_a[h][w], aligned[h][w])
                 )
-    assert best is not None  # 尺寸非空，至少枚举到 (0, 0)
-    return best
+                row_mismatches[h] += 1
+                col_mismatches[w] += 1
+
+    return Alignment(
+        weft_offset=best_weft,
+        warp_offset=best_warp,
+        mismatch_count=best_count,
+        mismatch_ratio=best_count / (picks * ends),
+        mismatches=mismatches,
+        row_mismatches=row_mismatches,
+        col_mismatches=col_mismatches,
+        aligned=aligned,
+    )
 
 
 def _prefix_sums(matrix: list[list[int]]) -> list[list[int]]:
