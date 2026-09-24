@@ -494,6 +494,202 @@ def test_best_alignment_dimension_mismatch():
     print("  ok: dimension mismatch raises DesignError")
 
 
+def _naive_best_alignment(matrix_a, matrix_b):
+    """朴素逐点比对参照：对每个经纬循环偏移构造完整对齐矩阵并逐点比较，
+    平局按 weft_offset、warp_offset 升序取先者。返回与 Alignment.to_dict
+    等价的字典，作为快速实现的对照基准。"""
+    picks, ends = len(matrix_a), len(matrix_a[0])
+    best = None
+    for weft_offset in range(picks):
+        for warp_offset in range(ends):
+            aligned = [
+                [matrix_b[(h + weft_offset) % picks][(w + warp_offset) % ends]
+                 for w in range(ends)]
+                for h in range(picks)
+            ]
+            mismatches = []
+            row_mismatches = [0] * picks
+            col_mismatches = [0] * ends
+            for h in range(picks):
+                for w in range(ends):
+                    if matrix_a[h][w] != aligned[h][w]:
+                        mismatches.append((h, w, matrix_a[h][w], aligned[h][w]))
+                        row_mismatches[h] += 1
+                        col_mismatches[w] += 1
+            count = len(mismatches)
+            if best is None or count < best["mismatch_count"]:
+                best = {
+                    "weft_offset": weft_offset,
+                    "warp_offset": warp_offset,
+                    "mismatch_count": count,
+                    "mismatch_ratio": count / (picks * ends),
+                    "mismatches": mismatches,
+                    "row_mismatches": row_mismatches,
+                    "col_mismatches": col_mismatches,
+                    "aligned": aligned,
+                }
+    return best
+
+
+def _random_matrix(picks, ends, rng):
+    return [[rng.randrange(2) for _ in range(ends)] for _ in range(picks)]
+
+
+def _shifted_copy(matrix, weft_offset, warp_offset, rng, noise=0):
+    """矩阵的经纬循环错位副本，并可按固定概率翻转若干单元加入噪声。"""
+    picks, ends = len(matrix), len(matrix[0])
+    copy = [
+        [matrix[(h + weft_offset) % picks][(w + warp_offset) % ends]
+         for w in range(ends)]
+        for h in range(picks)
+    ]
+    if noise:
+        for h in range(picks):
+            for w in range(ends):
+                if rng.random() < noise:
+                    copy[h][w] ^= 1
+    return copy
+
+
+def test_best_alignment_matches_naive_random():
+    """快速（大整数位计数）实现与朴素逐点比对在随机矩阵上逐字段一致：
+    覆盖方阵、非方阵（两个方向）、单行、单列、单单元及错位+噪声副本。"""
+    rng = random.Random(20260924)
+    shapes = [(1, 1), (1, 9), (9, 1), (7, 5), (5, 7), (8, 8), (11, 6), (6, 11)]
+    for picks, ends in shapes:
+        a = _random_matrix(picks, ends, rng)
+        matrices_b = [
+            _random_matrix(picks, ends, rng),
+            _shifted_copy(a, picks // 2, ends // 2, rng),
+            _shifted_copy(a, 1, 1, rng, noise=0.2),
+            _shifted_copy(a, picks - 1, ends - 1, rng, noise=0.1),
+        ]
+        for b in matrices_b:
+            result = best_alignment(a, b)
+            expected = _naive_best_alignment(a, b)
+            check(
+                (result.weft_offset, result.warp_offset)
+                == (expected["weft_offset"], expected["warp_offset"]),
+                f"{picks}x{ends}: offsets match naive",
+            )
+            check(result.mismatch_count == expected["mismatch_count"],
+                  f"{picks}x{ends}: mismatch count matches naive")
+            check(abs(result.mismatch_ratio - expected["mismatch_ratio"]) < 1e-12,
+                  f"{picks}x{ends}: mismatch ratio matches naive")
+            check(
+                [(m.row, m.col, m.design_value, m.other_value)
+                 for m in result.mismatches] == expected["mismatches"],
+                f"{picks}x{ends}: mismatch coordinates/details match naive",
+            )
+            check(result.row_mismatches == expected["row_mismatches"]
+                  and result.col_mismatches == expected["col_mismatches"],
+                  f"{picks}x{ends}: row/col summaries match naive")
+            check(result.aligned == expected["aligned"],
+                  f"{picks}x{ends}: aligned matrix matches naive")
+            # 输入矩阵不被修改
+            check(all(all(v in (0, 1) for v in row) for row in (a + b)),
+                  f"{picks}x{ends}: inputs left intact")
+    print("  ok: fast alignment matches naive pointwise compare on random matrices")
+
+
+def test_best_alignment_periodic_patterns_unchanged():
+    """周期纹样：存在多个并列最佳偏移时，结果（含平局裁决与全部明细）必须与
+    朴素逐点比对完全一致——优化不得改变周期纹样的比对结果。"""
+    rng = random.Random(77)
+
+    def tiled(tile, picks, ends):
+        th, tw = len(tile), len(tile[0])
+        return [[tile[h % th][w % tw] for w in range(ends)] for h in range(picks)]
+
+    # 2x2 基础花型平铺成 8x12（两方向均有周期，大量偏移并列）；
+    # 第二份取花型的行、列循环错位版，保证存在零错位对齐
+    tile = _random_matrix(2, 2, rng)
+    tile_shifted = [
+        [tile[(h + 1) % 2][(w + 1) % 2] for w in range(2)]
+        for h in range(2)
+    ]
+    # 3x2 花型及其行列循环错位版（用于非方阵周期用例）
+    tile5 = _random_matrix(3, 2, rng)
+    tile5_shifted = [
+        [tile5[(h + 1) % 3][(w + 1) % 2] for w in range(2)]
+        for h in range(3)
+    ]
+    cases = [
+        (tiled(tile, 8, 12), tiled(tile_shifted, 8, 12)),
+        # 纵向条纹（行方向全同）：任意纬向偏移并列
+        (tiled([[1, 0, 1, 0]], 6, 8), tiled([[0, 1, 0, 1]], 6, 8)),
+        # 横向条纹（列方向全同）：任意经向偏移并列（同相，行周期 2）
+        (tiled([[1], [0], [1], [0]], 8, 5), tiled([[1], [0], [1], [0]], 8, 5)),
+        # 常量矩阵：所有偏移并列零错位
+        ([[1] * 7 for _ in range(5)], [[1] * 7 for _ in range(5)]),
+        # 非方阵 + 3x2 周期：第二份花型取同一花型的行、列循环错位，
+        # 最佳偏移必然零错位且存在大量并列偏移
+        (tiled(tile5, 9, 8), tiled(tile5_shifted, 9, 8)),
+    ]
+    for a, b in cases:
+        result = best_alignment(a, b)
+        expected = _naive_best_alignment(a, b)
+        check(
+            (result.weft_offset, result.warp_offset)
+            == (expected["weft_offset"], expected["warp_offset"]),
+            f"periodic {len(a)}x{len(a[0])}: tie broken by (weft, warp) "
+            "ascending like naive",
+        )
+        check(result.mismatch_count == expected["mismatch_count"]
+              and result.mismatch_count == 0,
+              "periodic aligned copies: zero mismatches at best offset")
+        check(result.aligned == expected["aligned"]
+              and result.row_mismatches == expected["row_mismatches"]
+              and result.col_mismatches == expected["col_mismatches"]
+              and result.mismatches == [],
+              "periodic: aligned matrix and summaries match naive")
+    print("  ok: periodic patterns keep identical offsets/tie-breaks/details")
+
+
+def test_best_alignment_large_matrix_performance():
+    """较大矩阵耗时回归：朴素逐偏移构造矩阵+逐点比对在 64x64 上约需 20 秒；
+    快速实现必须远低于该量级。阈值取宽松上限（64x64 < 1s、128x128 < 2s），
+    同时独立校验最佳偏移下的错位数与直接逐点统计一致。"""
+    import time
+
+    for picks, ends, limit_seconds in ((64, 64, 1.0), (128, 128, 2.0)):
+        rng = random.Random(9001 + picks * 131 + ends)
+        a = _random_matrix(picks, ends, rng)
+        b = _shifted_copy(a, picks // 3, ends // 3, rng, noise=0.05)
+        timings = []
+        result = None
+        for _ in range(3):
+            start = time.perf_counter()
+            result = best_alignment(a, b)
+            timings.append(time.perf_counter() - start)
+        elapsed = min(timings)
+        check(elapsed < limit_seconds,
+              f"{picks}x{ends}: best_alignment {elapsed:.3f}s < {limit_seconds}s")
+        # 独立（不依赖打包大整数）复核：在最佳偏移处直接逐点统计错位数，
+        # 并验证该偏移确实不劣于随机抽查的其他偏移。
+        direct = sum(
+            1 for h in range(picks) for w in range(ends)
+            if a[h][w] != b[(h + result.weft_offset) % picks][
+                (w + result.warp_offset) % ends]
+        )
+        check(direct == result.mismatch_count,
+              f"{picks}x{ends}: bit-count result verified by direct scan")
+        for ro, co in ((0, 0), (1, 0), (0, 1), (picks - 1, ends - 1)):
+            sampled = sum(
+                1 for h in range(picks) for w in range(ends)
+                if a[h][w] != b[(h + ro) % picks][(w + co) % ends]
+            )
+            check(result.mismatch_count <= sampled,
+                  f"{picks}x{ends}: best offset no worse than sampled ({ro},{co})")
+        check(len(result.mismatches) == result.mismatch_count
+              and len(result.row_mismatches) == picks
+              and len(result.col_mismatches) == ends
+              and len(result.aligned) == picks
+              and all(len(row) == ends for row in result.aligned),
+              f"{picks}x{ends}: full detail structure built only for best offset")
+    print("  ok: 64x64/128x128 alignment timing regression and direct verification")
+
+
 def test_threshold_profile_cyclic_wrap():
     # 单列 1 1 0 1 1，cyclic 合并为长度 4 的经向浮长：
     # 阈值 1..3 各 1 条经向违规，阈值 4 起零违规
@@ -1123,6 +1319,9 @@ if __name__ == "__main__":
     test_best_alignment_mismatch_details()
     test_best_alignment_tie_break()
     test_best_alignment_dimension_mismatch()
+    test_best_alignment_matches_naive_random()
+    test_best_alignment_periodic_patterns_unchanged()
+    test_best_alignment_large_matrix_performance()
     test_threshold_profile_cyclic_wrap()
     test_threshold_profile_weft_direction()
     test_threshold_profile_matches_audit_and_validation()

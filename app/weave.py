@@ -862,6 +862,20 @@ def _cyclic_shift(
     ]
 
 
+def _pack_matrix(matrix: list[list[int]]) -> int:
+    """把 0/1 矩阵按行主序打包为单个大整数：bit (h*W + w) 为 matrix[h][w]。
+
+    每个 W 位宽的「位块」对应矩阵的一行，块内左低右高（低位为第 0 列），
+    块间低位到高位按行号升序排列。"""
+    packed = 0
+    for row in reversed(matrix):
+        block = 0
+        for w, value in enumerate(row):
+            block |= value << w  # 列 0 落在块内最低位
+        packed = (packed << len(row)) | block
+    return packed
+
+
 def best_alignment(
     matrix_a: list[list[int]],
     matrix_b: list[list[int]],
@@ -874,6 +888,19 @@ def best_alignment(
     与第一份矩阵逐点比较。两份矩阵尺寸必须一致（同纬同经），否则抛 DesignError。
     平局按行偏移（weft_offset）再列偏移（warp_offset）升序取先者——按偏移升序
     枚举且仅在错位严格更少时更新最优即可自然实现。不修改传入矩阵。
+
+    朴素实现对每个 (weft_offset, warp_offset) 都构造完整对齐矩阵并逐点比对，
+    复杂度 O((H·W)²)，64×64 需约 1600 万次偏移×单元的 Python 级比较（实测
+    单次约 20 秒）。这里把两份矩阵各打包成行主序大整数（见 _pack_matrix）：
+    - 纬向移位对应把整个大整数按 W 位为一块的整块循环旋转，经向移位对应各
+      W 位块内部的循环移位；
+    - 枚举按两偏移升序推进，每步只做一次增量旋转（纬向整块右移 1 块，经向
+      各块内右移 1 位，溢出的块/位用掩码补回另一端），不对每个偏移重新做
+      整幅移位；
+    - 错位数即两个大整数异或后 1 的位数（int.bit_count，C 层执行，结果精确
+      而非近似）。
+    因此计数阶段每个偏移只有常数次大整数运算（共 O(H·W) 次）；错位坐标、
+    行列汇总与对齐矩阵只对最终选定的最佳偏移构造一次。
     """
     if not matrix_a or not matrix_a[0] or not matrix_b or not matrix_b[0]:
         raise DesignError("interlacing matrices must be non-empty")
@@ -885,35 +912,74 @@ def best_alignment(
             f"{len(matrix_b)}x{len(matrix_b[0])} (weft_picks x warp_ends)"
         )
 
-    best: Alignment | None = None
+    bits = picks * ends
+    packed_a = _pack_matrix(matrix_a)
+    packed_b = _pack_matrix(matrix_b)
+
+    # 全部 bits 位置 1 的掩码（亦为每个 W 位块都填满的掩码）。
+    all_mask = (1 << bits) - 1
+    # 每个位块（行）的最低位组成的掩码：…0001 | 0001<<W | 0001<<2W…
+    low_bit_pattern = sum(1 << (h * ends) for h in range(picks))
+    # 最低一个位块（最后一行）全部位组成的掩码，用于纬向增量旋转时把整行
+    # 块补入最高块。
+    low_block_pattern = (1 << ends) - 1
+
+    best_weft = best_warp = 0
+    best_count: int | None = None
+    # 按 weft_offset 外层、warp_offset 内层升序枚举，平局自然保留最先遇到者。
+    # 两个方向都用「增量旋转 1 步」推进，每步只有常数次大整数移位/按位运算，
+    # 不对每个偏移重新做整幅移位。
+    row_shifted = packed_b  # weft_offset = 0
     for weft_offset in range(picks):
+        shifted = row_shifted  # warp_offset = 0
         for warp_offset in range(ends):
-            aligned = _cyclic_shift(matrix_b, weft_offset, warp_offset)
-            mismatches: list[MismatchPoint] = []
-            row_mismatches = [0] * picks
-            col_mismatches = [0] * ends
-            for h in range(picks):
-                for w in range(ends):
-                    if matrix_a[h][w] != aligned[h][w]:
-                        mismatches.append(
-                            MismatchPoint(h, w, matrix_a[h][w], aligned[h][w])
-                        )
-                        row_mismatches[h] += 1
-                        col_mismatches[w] += 1
-            count = len(mismatches)
-            if best is None or count < best.mismatch_count:
-                best = Alignment(
-                    weft_offset=weft_offset,
-                    warp_offset=warp_offset,
-                    mismatch_count=count,
-                    mismatch_ratio=count / (picks * ends),
-                    mismatches=mismatches,
-                    row_mismatches=row_mismatches,
-                    col_mismatches=col_mismatches,
-                    aligned=aligned,
+            count = (packed_a ^ shifted).bit_count()
+            if best_count is None or count < best_count:
+                best_count = count
+                best_weft = weft_offset
+                best_warp = warp_offset
+            if warp_offset + 1 < ends:
+                # 块内右移 1 位即经向左移 1 列；先屏蔽各块最低位，避免 >> 1
+                # 把本块列 0 的位移入上一块的最高位；各块移出的最低位补回本块
+                # 最高位。
+                shifted = (
+                    ((shifted & ~low_bit_pattern) >> 1)
+                    | ((shifted & low_bit_pattern) << (ends - 1))
+                ) & all_mask
+        if weft_offset + 1 < picks:
+            # 整体按 ends 位块右移 1 块即纬向上移 1 行：最低块（最后一行）
+            # 整行补入最高块（第一行）。
+            row_shifted = (
+                (row_shifted >> ends)
+                | ((row_shifted & low_block_pattern) << (bits - ends))
+            ) & all_mask
+    assert best_count is not None  # 尺寸非空，至少枚举到 (0, 0)
+
+    # 仅为最佳偏移构造错位坐标、行列汇总与对齐矩阵（各一次 O(H·W)）。
+    aligned = _cyclic_shift(matrix_b, best_weft, best_warp)
+    mismatches: list[MismatchPoint] = []
+    row_mismatches = [0] * picks
+    col_mismatches = [0] * ends
+    for h in range(picks):
+        for w in range(ends):
+            if matrix_a[h][w] != aligned[h][w]:
+                mismatches.append(
+                    MismatchPoint(h, w, matrix_a[h][w], aligned[h][w])
                 )
-    assert best is not None  # 尺寸非空，至少枚举到 (0, 0)
-    return best
+                row_mismatches[h] += 1
+                col_mismatches[w] += 1
+    count = len(mismatches)
+    assert count == best_count  # 与大整数计数互为校验，二者必须一致
+    return Alignment(
+        weft_offset=best_weft,
+        warp_offset=best_warp,
+        mismatch_count=count,
+        mismatch_ratio=count / (picks * ends),
+        mismatches=mismatches,
+        row_mismatches=row_mismatches,
+        col_mismatches=col_mismatches,
+        aligned=aligned,
+    )
 
 
 def _prefix_sums(matrix: list[list[int]]) -> list[list[int]]:
